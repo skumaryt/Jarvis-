@@ -1,0 +1,378 @@
+name: Build Jarvis APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Create project files
+        run: |
+          true
+          cat > settings.gradle.kts <<'JARVIS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Jarvis"
+          include(":app")
+          JARVIS_EOF
+          true
+          cat > build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          JARVIS_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'JARVIS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.jarvis.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.jarvis.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          JARVIS_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'JARVIS_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+              </queries>
+              <application android:label="Jarvis" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".JarvisService" android:exported="false" android:label="Jarvis"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          JARVIS_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'JARVIS_EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_desc"/>
+          JARVIS_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'JARVIS_EOF'
+          <resources>
+              <string name="service_desc">Lets Jarvis tap, scroll, type and press Back/Home when you ask it to by voice.</string>
+          </resources>
+          JARVIS_EOF
+          mkdir -p app/src/main/java/com/jarvis/app
+          cat > app/src/main/java/com/jarvis/app/JarvisService.kt <<'JARVIS_EOF'
+          package com.jarvis.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class JarvisService : AccessibilityService() {
+              companion object { var inst: JarvisService? = null }
+
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun clickText(t: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  for (n in root.findAccessibilityNodeInfosByText(t)) {
+                      var c: AccessibilityNodeInfo? = n
+                      while (c != null && !c.isClickable) c = c.parent
+                      if (c != null) { c.performAction(AccessibilityNodeInfo.ACTION_CLICK); return true }
+                  }
+                  return false
+              }
+
+              fun typeText(t: String): Boolean {
+                  val f = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  val b = Bundle()
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, t)
+                  return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)
+              }
+
+              fun scroll(down: Boolean): Boolean {
+                  val n = findScrollable(rootInActiveWindow) ?: return false
+                  return n.performAction(if (down) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) { val r = findScrollable(n.getChild(i)); if (r != null) return r }
+                  return null
+              }
+          }
+          JARVIS_EOF
+          mkdir -p app/src/main/java/com/jarvis/app
+          cat > app/src/main/java/com/jarvis/app/Brain.kt <<'JARVIS_EOF'
+          package com.jarvis.app
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Brain {
+              private val history = ArrayList<String>()
+
+              private fun say(t: String) = JSONObject().put("action", "say").put("text", t)
+
+              fun ask(key: String, cmd: String, apps: String, facts: String): JSONObject {
+                  if (key.isBlank()) return say("Please paste your free Gemini API key first (aistudio.google.com).")
+                  val sys = "You are Jarvis, a smart, witty, concise personal assistant on the user's Android phone. " +
+                      "Reply ONLY with one JSON object. Always write the user-facing 'text' in the same language and script the user used (English, Urdu, Roman Urdu or Hindi), under 60 words. " +
+                      "Actions: {\"action\":\"say\",\"text\":\"...\"} for answers and chat (you know general knowledge like Gemini); " +
+                      "{\"action\":\"open_app\",\"app\":\"<name from the installed list>\",\"text\":\"...\"}; " +
+                      "{\"action\":\"search\",\"query\":\"...\",\"text\":\"...\"}; {\"action\":\"open_url\",\"url\":\"https://...\",\"text\":\"...\"}; " +
+                      "{\"action\":\"dial\",\"number\":\"...\",\"text\":\"...\"} (opens dialer only); " +
+                      "{\"action\":\"click\",\"target\":\"visible button text\"}; {\"action\":\"type\",\"value\":\"...\"}; " +
+                      "{\"action\":\"back\"}; {\"action\":\"home\"}; {\"action\":\"scroll_down\"}; {\"action\":\"scroll_up\"}; {\"action\":\"notifications\"}; " +
+                      "{\"action\":\"remember\",\"fact\":\"...\",\"text\":\"...\"}. " +
+                      "Never claim an action succeeded; the app reports results. Installed apps: $apps. Known facts about the user: ${facts.ifBlank { "none" }}."
+                  val prompt = history.joinToString("\n") + "\nUser: " + cmd
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+                      .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
+                      .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.setRequestProperty("Content-Type", "application/json")
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.doOutput = true
+                  c.connectTimeout = 15000
+                  c.readTimeout = 30000
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val ok = c.responseCode in 200..299
+                  val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (!ok) {
+                      val msg = runCatching { JSONObject(txt).getJSONObject("error").getString("message") }.getOrDefault("")
+                      return say("AI error ${c.responseCode}: $msg")
+                  }
+                  val out = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                  val a = runCatching { JSONObject(out) }.getOrElse { say(out) }
+                  history.add("User: $cmd")
+                  history.add("Jarvis: " + a.optString("text", a.optString("action")))
+                  while (history.size > 12) history.removeAt(0)
+                  return a
+              }
+          }
+          JARVIS_EOF
+          mkdir -p app/src/main/java/com/jarvis/app
+          cat > app/src/main/java/com/jarvis/app/MainActivity.kt <<'JARVIS_EOF'
+          package com.jarvis.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.text.InputType
+          import android.view.View
+          import android.widget.*
+          import org.json.JSONObject
+          import java.util.Locale
+
+          class MainActivity : Activity(), TextToSpeech.OnInitListener {
+              private lateinit var tts: TextToSpeech
+              private lateinit var log: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var mic: Button
+              private var recognizer: SpeechRecognizer? = null
+              private val langs = listOf("en-US", "ur-PK", "hi-IN")
+              private var li = 0
+              private val prefs by lazy { getSharedPreferences("jarvis", MODE_PRIVATE) }
+              private val ink = 0xFFEAF4FF.toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  tts = TextToSpeech(this, this)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                      setBackgroundColor(0xFF06101D.toInt())
+                  }
+                  root.addView(TextView(this).apply { text = "Jarvis"; textSize = 26f; setTextColor(ink) })
+
+                  val key = EditText(this).apply {
+                      hint = "Gemini API key"; setText(prefs.getString("key", ""))
+                      setTextColor(ink); setHintTextColor(0xFF8EA6C4.toInt()); isSingleLine = true
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  root.addView(key)
+
+                  val row = LinearLayout(this)
+                  val save = Button(this).apply { text = "Save key"; setOnClickListener { prefs.edit().putString("key", key.text.toString().trim()).apply(); add("Key saved.") } }
+                  val acc = Button(this).apply { text = "Enable control"; setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
+                  val lang = Button(this).apply { text = "en-US" }
+                  lang.setOnClickListener {
+                      li = (li + 1) % langs.size; lang.text = langs[li]
+                      tts.setLanguage(Locale.forLanguageTag(langs[li]))
+                  }
+                  row.addView(save); row.addView(acc); row.addView(lang)
+                  root.addView(row)
+
+                  log = TextView(this).apply { setTextColor(ink); textSize = 16f }
+                  scroll = ScrollView(this).apply { addView(log) }
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  val input = EditText(this).apply { hint = "Type a command"; setTextColor(ink); setHintTextColor(0xFF8EA6C4.toInt()); isSingleLine = true }
+                  val send = Button(this).apply { text = "Send"; setOnClickListener { val t = input.text.toString(); input.setText(""); if (t.isNotBlank()) handle(t) } }
+                  val row2 = LinearLayout(this)
+                  row2.addView(input, LinearLayout.LayoutParams(0, -2, 1f)); row2.addView(send)
+                  root.addView(row2)
+
+                  mic = Button(this).apply { text = "Tap to speak"; textSize = 20f; setOnClickListener { micClick() } }
+                  root.addView(mic)
+                  setContentView(root)
+                  add("Jarvis ready. 1) Save your key. 2) Tap Enable control and turn Jarvis on. 3) Tap Tap to speak.")
+              }
+
+              override fun onInit(status: Int) { if (status == TextToSpeech.SUCCESS) tts.setLanguage(Locale.forLanguageTag(langs[li])) }
+
+              private fun add(t: String) { log.append(t + "\n\n"); scroll.post { scroll.fullScroll(View.FOCUS_DOWN) } }
+              private fun say(t: String) { add("Jarvis: $t"); tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "j") }
+
+              private fun micClick() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
+                  }
+                  listen()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(code, p, r)
+                  if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) listen() else add("Microphone permission denied.")
+              }
+
+              private fun listen() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) { say("Speech recognition is not available on this phone."); return }
+                  recognizer?.destroy()
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  recognizer = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(res: Bundle?) {
+                          mic.text = "Tap to speak"
+                          res?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { handle(it) }
+                      }
+                      override fun onError(e: Int) { mic.text = "Tap to speak"; add("Mic error code $e (try again)") }
+                      override fun onReadyForSpeech(p: Bundle?) { mic.text = "Listening..." }
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(b: Bundle?) {}
+                      override fun onEvent(t: Int, b: Bundle?) {}
+                  })
+                  r.startListening(
+                      Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, langs[li])
+                  )
+              }
+
+              private fun apps(): Map<String, String> {
+                  val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  return packageManager.queryIntentActivities(i, 0)
+                      .associate { it.loadLabel(packageManager).toString().lowercase() to it.activityInfo.packageName }
+              }
+
+              private fun handle(cmd: String) {
+                  add("You: $cmd")
+                  val key = prefs.getString("key", "") ?: ""
+                  val facts = prefs.getString("facts", "") ?: ""
+                  val names = apps().keys.take(200).joinToString(", ")
+                  Thread {
+                      try {
+                          val a = Brain.ask(key, cmd, names, facts)
+                          runOnUiThread { act(a) }
+                      } catch (e: Exception) {
+                          runOnUiThread { say("Error: ${e.message}") }
+                      }
+                  }.start()
+              }
+
+              private fun svc(): JarvisService? {
+                  val s = JarvisService.inst
+                  if (s == null) say("Control is off. Tap Enable control and turn Jarvis on in Accessibility settings.")
+                  return s
+              }
+
+              private fun act(a: JSONObject) {
+                  val reply = a.optString("text", "")
+                  when (a.optString("action")) {
+                      "say" -> say(reply)
+                      "open_app" -> {
+                          val n = a.optString("app").lowercase()
+                          val m = apps()
+                          val pkg = m[n] ?: m.entries.firstOrNull { it.key.contains(n) || n.contains(it.key) }?.value
+                          val launch = pkg?.let { packageManager.getLaunchIntentForPackage(it) }
+                          if (launch != null) { say(reply.ifBlank { "Opening $n" }); startActivity(launch) } else say("I could not find an app called $n.")
+                      }
+                      "search" -> {
+                          say(reply.ifBlank { "Searching" })
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(a.optString("query")))))
+                      }
+                      "open_url" -> { say(reply.ifBlank { "Opening" }); startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(a.optString("url")))) }
+                      "dial" -> { say(reply.ifBlank { "Opening the dialer" }); startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + a.optString("number")))) }
+                      "click" -> svc()?.let { say(if (it.clickText(a.optString("target"))) "Done." else "I could not find that on screen.") }
+                      "type" -> svc()?.let { say(if (it.typeText(a.optString("value"))) "Typed." else "No text box is focused.") }
+                      "back" -> svc()?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                      "home" -> svc()?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+                      "notifications" -> svc()?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS)
+                      "scroll_down" -> svc()?.let { if (!it.scroll(true)) say("Nothing to scroll.") }
+                      "scroll_up" -> svc()?.let { if (!it.scroll(false)) say("Nothing to scroll.") }
+                      "remember" -> {
+                          prefs.edit().putString("facts", (prefs.getString("facts", "") ?: "") + "; " + a.optString("fact")).apply()
+                          say(reply.ifBlank { "Got it." })
+                      }
+                      else -> say(reply.ifBlank { "I did not understand that." })
+                  }
+              }
+
+              override fun onDestroy() { tts.shutdown(); recognizer?.destroy(); super.onDestroy() }
+          }
+          JARVIS_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: { name: jarvis-apk, path: app/build/outputs/apk/debug/app-debug.apk }
